@@ -9,6 +9,43 @@ import inspect
 import os
 from hellaswag import render_example, iterate_examples
 
+@dataclass
+class GPTConfig(): # Configuration of our transformer
+    block_size: int = 1024 # maximum sequence length (context length)
+    vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 tokens + 1 <|endoftext|> token = 50257 which is inefficient in terms of cuda processing, new vocab size 50304 could be easily divided by a lot of numbers
+    n_layer: int = 12 # number of layers (transformer blocks: aach block has attention + MLP + layer norms)
+    n_head: int = 12 # number of heads per transformer blocks. Each head sees 768 ÷ 12 = 64 dimensions. Different heads can learn different attention patterns.
+    n_embd: int = 768 # embedding dimension
+    mlp_type: str = "swiglu" # MLP activation type: "gelu" or "swiglu"
+
+
+# ========================================= Training parameters ==================================================================
+
+torch.set_float32_matmul_precision('high')
+
+use_compile = True # Using of torch.compile() to speed up the training process
+
+# Gradient accumulation parameters
+total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
+B = 16 # ~16 GB of memory, ideally maximize to B = 32 (for ~28 GB in 32GB RTX 5090) or B = 64 (in more modern architectures e.g. A100 40/80GB)
+T = 1024 # sequence of length (context window size) for GPT-2, 2048 for GPT-3
+
+max_lr = 6e-4 # Another point for imporvement --> increase the lr up to x3
+min_lr = max_lr * 0.1
+warmup_steps = 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
+max_steps = 19073 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
+
+weight_decay = 0.1
+eval_steps = 250 # evaluate the model every 250 steps
+
+# Set the torch seed parameter
+torch.manual_seed(1337)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(1337)
+
+# ================================================================================================================================
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -18,7 +55,7 @@ class CausalSelfAttention(nn.Module):
         # key, query, value projections for all heads, but in batches
         # Single linear layer that creates Query, Key, Value all at once. More efficient than 3 separate layers. 
         # Will be split into Q, K, V later. 
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # Another possible point for improvement: 3 * config.n_embd is an 'ugly' number which might be hard to parallelize. Maybe use 4 instead?
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd) # we multiply by 3 because later we will split it into 3 matricies: Q, K, V
 
         # Output projection after attention is computed. 
         # Projects concatenated multi-head output back to embedding dimension [B, T, 768]
@@ -74,16 +111,40 @@ class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # expand the embedding dimension 4 times
-        self.gelu = nn.GELU(approximate='tanh') # apply GeLU non-linearity # Improvement Point #2 : switch to more recent non-linear functions
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) # compress back to original size
-        self.c_proj.NANOGPT_SCALE_INIT = 1
+        mlp_type = getattr(config, "mlp_type", "gelu")
+        self.mlp_type = mlp_type
+
+        # SwiGLU MLP
+        if mlp_type == "swiglu":
+            # Set inner dim ~ 8/3 * d so that parameter count matches 4d-GELU
+            inner_dim = int(4 * config.n_embd * 2 / 3) # expand the matrix 4 times to use it as a "thinking space", then reduce it to 2/3 to match the GeLU params count
+            # Round up to multiple of 256 for GPU efficiency
+            inner_dim = ((inner_dim + 255) // 256) * 256
+            self.inner_dim = inner_dim
+            # value and gate
+            self.c_fc = nn.Linear(config.n_embd, 2 * inner_dim) # convolutional fully-connected --> expand from n_embd to 2 * inner_dim
+            self.c_proj = nn.Linear(inner_dim, config.n_embd) # convolutional projection --> compress back from 2 * inner_dim to n_embd
+            self.c_proj.NANOGPT_SCALE_INIT = 1
+
+        else:
+            # Standard GELU MPL
+            self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd) # expand the embedding dimension 4 times
+            self.gelu = nn.GELU(approximate='tanh') # apply GeLU non-linearity
+            self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd) # compress back to original size
+            self.c_proj.NANOGPT_SCALE_INIT = 1
     
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-
+        if self.mlp_type == "swiglu": # [B, T, n_embd]
+            x_in = self.c_fc(x) # expand the input from [B, T, n_embd] --> [B, T, inner_dim * 2]
+            # x_gate: Passed through Swish, produces values 0→1ish that control "how much" information we pass through
+            # x_up: The actual information being passed through
+            x_gate, x_up = x_in.chunk(2, dim=-1) # [B, T, inner_dim]
+            x = F.silu(x_gate) * x_up # [B, T, inner_dim]
+            x = self.c_proj(x) # [B, T, n_embd]
+        else:
+            x = self.c_fc(x)
+            x = self.gelu(x)
+            x = self.c_proj(x)
         return x
 
 class Block(nn.Module):
@@ -100,14 +161,6 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))  # Normalize → MLP → Add residual
         return x
 
-@dataclass
-class GPTConfig(): # Configuration of our GPT-2 transformer
-    block_size: int = 1024 # maximum sequence length (context length)
-    vocab_size: int = 50257 # number of tokens: 50,000 BPE merges + 256 tokens + 1 <|endoftext|> token
-    n_layer: int = 12 # number of layers (transformer blocks: aach block has attention + MLP + layer norms)
-    n_head: int = 12 # number of heads per transformer blocks. Each head sees 768 ÷ 12 = 64 dimensions. Different heads can learn different attention patterns.
-    n_embd: int = 768 # embedding dimension
-
 class GPT(nn.Module):
 
     def __init__(self, config):
@@ -115,13 +168,13 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embedding
-            wpe = nn.Embedding(config.block_size, config.n_embd), # word position embedding 
+            wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embedding [B, T, 768]
+            wpe = nn.Embedding(config.block_size, config.n_embd), # word position embedding [B, T, 768]
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # hidden layers (a list of transformer blocks)
             ln_f = nn.LayerNorm(config.n_embd) # layer norm final after all transformer blocks
         ))
 
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language modelling head, projects embeddings back to vocabulary logits
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language modelling head, projects embeddings back to vocabulary logits [B, T, 50304]
 
         # weights sharing scheme
         self.transformer.wte.weight = self.lm_head.weight
@@ -376,18 +429,8 @@ else:
 
 device_type = 'cuda' if device.startswith('cuda') else 'cpu' # for autocast
 
-# ========================== Set other training parameters: seed, batch size, grad. accum, etc. ===========================
+# =========================================== Assert training parameters ====================================================
 
-torch.manual_seed(1337)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed(1337)
-
-# Gradient accumulation parameters
-total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
-B = 16 # Set 64 for real training! Micro-batch size # 64 batches * 1024 sequence * 8 gpus = 524,288 tokens. In case we set T=2048 as for GPT-3, then decrease B=32 to match the 0.5M token in a micro_batch
-T = 1024 # sequence of length (context window size) for GPT-2, 2048 for GPT-3
-
-torch.set_float32_matmul_precision('high')
 
 assert total_batch_size % (B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T * ddp_world_size"
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
@@ -403,9 +446,9 @@ val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_w
 
 # ================================ Instantiate the model ====================================================================
 
-model = GPT(GPTConfig(vocab_size=50304)) # Previous vocab was 50257 which is inefficient in terms of cuda processing, new vocab size could be easily divided by a lot of numbers
+model = GPT(GPTConfig(mlp_type="swiglu"))
 model.to(device)
-use_compile = True # torch.compile interferes with HellaSwag eval and Generation.
+
 if use_compile:
     model = torch.compile(model)
 # Wrap with DDP
@@ -415,10 +458,6 @@ raw_model = model.module if ddp else model # always contains the "raw" unwrapped
 
 # ================================================ Learning rate Scheduler =================================================
 
-max_lr = 6e-4 # Another point for imporvement --> increase the lr up to x3, other people show it works good
-min_lr = max_lr * 0.1
-warmup_steps = 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
-max_steps = 19073 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
 
 def get_lr(it):
     # 1) linear warmup for warmup_iters step
@@ -435,7 +474,7 @@ def get_lr(it):
 
 # ======================================= Configure the optimizer and a logger ===============================================
 
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+optimizer = raw_model.configure_optimizers(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
 
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
@@ -448,8 +487,6 @@ with open(log_file, "w") as f: # open wor writing to clear the file
 
 import tiktoken 
 enc = tiktoken.get_encoding('gpt2') # iniatilize the encoder for token generation
-
-eval_steps = 250
 
 for step in range(max_steps):
     t0 = time.time()
@@ -525,7 +562,7 @@ for step in range(max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # Generate from the model on the last step
-    if last_step:
+    if last_step and master_process:
         model.eval()
         num_return_sequences = 4
         max_length = 32
@@ -534,7 +571,7 @@ for step in range(max_steps):
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
         xgen = tokens.to(device)
         sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
+        sample_rng.manual_seed(42)
         while xgen.size(1) < max_length:
             # forward the model to get the logits
             with torch.no_grad():
