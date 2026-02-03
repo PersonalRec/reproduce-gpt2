@@ -19,7 +19,7 @@ This project is a near complete reproduction of the original GPT-2 124M foundati
 * **Base implementation:** Andrej Karpathy's build-nanoGPT repo
 * **Dataset:** FineWeb-Edu 10B tokens
 * **Batch size:** 524,288 tokens per step (~0.5M)
-* **Total steps:** 19,073 steps
+* **Total steps:** 19,073 steps (1 epoch)
 
 ## Results Achieved
 

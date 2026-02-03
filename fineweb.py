@@ -57,8 +57,8 @@ def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
 # tokenize all documents and write output shards, each of shard_size tokens (last shard has remainder)
-nprocs = max(1, os.cpu_count()//2)
-with mp.Pool(nprocs) as pool:
+nprocs = max(1, os.cpu_count()) # use all CPU cores
+with mp.Pool(nprocs) as pool: 
     shard_index = 0
     # preallocate buffer to hold current shard
     all_tokens_np = np.empty((shard_size,), dtype=np.uint16)

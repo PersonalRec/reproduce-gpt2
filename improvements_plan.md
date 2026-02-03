@@ -74,7 +74,23 @@ Add more evals in addition to HellaSwag, e.g. Eleuther Evaluation Harness
 
 Single benchmark can be misleading or overfit. Eleuther Evaluation Harness provides standardized evaluation across multiple tasks (MMLU, ARC, TruthfulQA, etc.) giving better signal about actual model capabilities.
 
+# Further improvements (Experiments): 
 
 ### Curriculum Learning
 
 Try to do initial model tuning (e.g. during the warmup) using baby-books
+
+
+### Dual PatchNorm (Post-Embedding Normalization)
+
+Add LayerNorm/RMSNorm right after (tok_embed + pos_embed)
+
+The embedding layer often has disproportionately large gradient norms compared to deeper layers, causing training instability. Adding normalization after the embedding "sandwiches" the input and brings gradient magnitudes in line with the rest of the network. This is a trivial 2-line change that requires no additional hyperparameters, adds negligible compute overhead, and can enable training with higher learning rates.
+
+
+### nGPT (Normalized Transformer)
+
+Normalize everything (weights, states, embeddings) to unit hypersphere
+
+nGPT constrains all vectors to have unit norm, turning matrix multiplication into cosine similarity. Instead of using normalization as a patch, the network itself becomes the normalization. This eliminates the need for LayerNorm/RMSNorm layers entirely. The optimizer no longer fights against varying vector magnitudes, resulting in a smoother optimization landscape. Achieves 4-20x faster convergence, and renders weight decay and learning rate warmup largely unnecessary. However, requires significant architectural changes and is more experimental.
+

@@ -8,6 +8,8 @@ import time
 import inspect
 import os
 from hellaswag import render_example, iterate_examples
+import tiktoken
+import numpy as np
 
 @dataclass
 class GPTConfig(): # Configuration of our transformer
@@ -27,16 +29,16 @@ use_compile = True # Using of torch.compile() to speed up the training process
 
 # Gradient accumulation parameters
 total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
-B = 16 # ~16 GB of memory, ideally maximize to B = 32 (for ~28 GB in 32GB RTX 5090) or B = 64 (in more modern architectures e.g. A100 40/80GB)
+B = 32 # ~16 GB of memory, ideally maximize to B = 32 (for ~28 GB in 32GB RTX 5090) or B = 64 (in more modern architectures e.g. A100 40/80GB)
 T = 1024 # sequence of length (context window size) for GPT-2, 2048 for GPT-3
 
-max_lr = 6e-4 # Another point for imporvement --> increase the lr up to x3
+max_lr = 6e-4 * 3 # Another point for imporvement --> increase the lr up to x3
 min_lr = max_lr * 0.1
-warmup_steps = 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
+warmup_steps = 285 # 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
 max_steps = 19073 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
 
 weight_decay = 0.1
-eval_steps = 250 # evaluate the model every 250 steps
+eval_steps = 500 # evaluate the model every 250 steps
 
 # Set the torch seed parameter
 torch.manual_seed(1337)
@@ -151,9 +153,9 @@ class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
 
-        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.ln_1 = nn.RMSNorm(config.n_embd)
         self.attn = CausalSelfAttention(config)
-        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.ln_2 = nn.RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
     def forward(self, x):
@@ -171,7 +173,7 @@ class GPT(nn.Module):
             wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embedding [B, T, 768]
             wpe = nn.Embedding(config.block_size, config.n_embd), # word position embedding [B, T, 768]
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # hidden layers (a list of transformer blocks)
-            ln_f = nn.LayerNorm(config.n_embd) # layer norm final after all transformer blocks
+            ln_f = nn.RMSNorm(config.n_embd) # layer norm final after all transformer blocks
         ))
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language modelling head, projects embeddings back to vocabulary logits [B, T, 50304]
@@ -314,28 +316,22 @@ class GPT(nn.Module):
         return optimizer
 
 # ========================================= Data Loader ==================================================================
-import tiktoken
-import numpy as np
+# Improved DataLoaderLite with proper shuffling for multi-epoch training
 
-def load_tokens(filename):
-    npt = np.load(filename)
-    npt = npt.astype(np.int32) # added after video
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
-
-# Point for improvement: if we do several epochs instead of 1, the data comes in the exactly same order. 
-# It would be nice to shuffle/permutate data randomly, permute the documents around in every single shard in every single epoch for several epochs training.
-# Potentially even permute the shards
 class DataLoaderLite:
-    def __init__(self, B, T, process_rank, num_processes, split):
+    def __init__(self, B, T, process_rank, num_processes, split, data_root='edu_fineweb10B', seed=1337):
         self.B = B
         self.T = T
         self.process_rank = process_rank
         self.num_processes = num_processes
+        self.split = split
         assert split in {'train', 'val'}
-
-        # get the shard filenames
-        data_root = "edu_fineweb10B"
+        
+        # Initialize random number generator for shuffling
+        self.rng = np.random.default_rng(seed)
+        self.base_seed = seed
+        
+        # Get the shard filenames
         shards = os.listdir(data_root)
         shards = [s for s in shards if split in s]
         shards = sorted(shards)
@@ -344,27 +340,99 @@ class DataLoaderLite:
         assert len(shards) > 0, f"no shards found for split {split}"
         if master_process:
             print(f"found {len(shards)} shards for split {split}")
-        self.reset()
-
-    def reset(self):
-        # state, init at shard zero
-        self.current_shard = 0
-        self.tokens = load_tokens(self.shards[self.current_shard])
-        self.current_position = self.B * self.T * self.process_rank
-
+        
+        # Memory-map all shards for efficient access (doesn't load into RAM)
+        self.mmap_shards = [np.load(f, mmap_mode='r') for f in self.shards]
+        self.shard_lengths = [m.shape[0] for m in self.mmap_shards]
+        
+        # Build global window index and initialize pointer
+        self._build_index()
+        self.ptr = 0
+    
+    def _build_index(self):
+        """
+        Build a global list of all (shard_id, start_offset) windows across all shards.
+        Each window represents one valid training example of length T+1 (T inputs + 1 target).
+        """
+        all_indices = []
+        for shard_id, length in enumerate(self.shard_lengths):
+            # Calculate number of non-overlapping windows in this shard
+            # We need T+1 tokens per window (T for input, 1 for final target)
+            num_windows = (length - 1) // self.T  # -1 because we need one extra token for targets
+            if num_windows <= 0:
+                continue
+            
+            # Create array of starting positions for each window
+            starts = (np.arange(num_windows) * self.T).astype(np.int64)
+            shard_ids = np.full_like(starts, shard_id, dtype=np.int64)
+            pairs = np.stack([shard_ids, starts], axis=1)
+            all_indices.append(pairs)
+        
+        all_indices = np.concatenate(all_indices, axis=0)
+        
+        if self.split == "train":
+            # Shuffle globally so batches contain windows from different shards/positions
+            self.rng.shuffle(all_indices)
+            # Split across DDP ranks: each GPU gets every num_processes-th window
+            # This ensures each GPU sees unique, non-overlapping data
+            self.index = all_indices[self.process_rank::self.num_processes]
+        else:
+            # Validation: no shuffle, deterministic across all ranks
+            # Each rank still processes its own slice for parallel evaluation
+            self.index = all_indices[self.process_rank::self.num_processes]
+        
+        if master_process:
+            print(f"{self.split}: {len(all_indices)} total windows, {len(self.index)} windows for this rank")
+    
+    def __len__(self):
+        """Number of full batches available in the dataset for this rank."""
+        return len(self.index) // self.B
+    
     def next_batch(self):
+        """
+        Return one batch of shape (B, T) for inputs x and targets y.
+        Reads from memory-mapped shards for efficiency.
+        """
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
-        self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds, advance to next shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = load_tokens(self.shards[self.current_shard])
-            self.current_position = B * T * self.process_rank
+        
+        # Get B windows from the shuffled index
+        if self.ptr + B > len(self.index):
+            # If we don't have enough windows left, wrap around (start new epoch)
+            self.ptr = 0
+            if self.split == "train":
+                # Reshuffle for the new epoch
+                self._build_index()
+        
+        rows = self.index[self.ptr : self.ptr + B]
+        self.ptr += B
+        
+        # Gather tokens from memory-mapped shards
+        xs, ys = [], []
+        for shard_id, start in rows:
+            # Read T+1 tokens: T for input, last one shifts to create target
+            tokens = self.mmap_shards[shard_id][start : start + T + 1].astype(np.int64)
+            tokens = torch.from_numpy(tokens)
+            xs.append(tokens[:-1])  # Input: first T tokens
+            ys.append(tokens[1:])   # Target: last T tokens (shifted by 1)
+        
+        x = torch.stack(xs)
+        y = torch.stack(ys)
         return x, y
+    
+    def reset(self, new_seed=None):
+        """
+        Reset the data loader to the beginning.
+        Optionally provide a new seed to get different shuffling (for new epochs).
+        """
+        if new_seed is not None:
+            self.rng = np.random.default_rng(new_seed)
+        elif self.split == "train":
+            # Auto-increment seed for different shuffling each reset
+            self.base_seed += 1
+            self.rng = np.random.default_rng(self.base_seed)
+        
+        self._build_index()
+        self.ptr = 0
 
 
 # helper function for HellaSwag eval
@@ -441,8 +509,11 @@ if master_process:
 
 # ================================ Instantiate the data loader ==============================================================
 
-train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train')
-val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val')
+data_root = "edu_fineweb10B"  # Directory containing the tokenized shards
+train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
+                               split='train', data_root=data_root, seed=1337)
+val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, 
+                             split='val', data_root=data_root, seed=1337)
 
 # ================================ Instantiate the model ====================================================================
 
