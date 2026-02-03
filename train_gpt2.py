@@ -15,9 +15,13 @@ import numpy as np
 class GPTConfig(): # Configuration of our transformer
     block_size: int = 1024 # maximum sequence length (context length)
     vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 tokens + 1 <|endoftext|> token = 50257 which is inefficient in terms of cuda processing, new vocab size 50304 could be easily divided by a lot of numbers
-    n_layer: int = 12 # number of layers (transformer blocks: aach block has attention + MLP + layer norms)
+    n_layer: int = 12 # number of layers (transformer blocks: each block has attention + MLP + RMSNorms)
     n_head: int = 12 # number of heads per transformer blocks. Each head sees 768 ÷ 12 = 64 dimensions. Different heads can learn different attention patterns.
     n_embd: int = 768 # embedding dimension
+
+    # additional options
+    use_rope: bool = True          # use RoPE embedding for training
+    rope_base: float = 10000.0
     mlp_type: str = "swiglu" # MLP activation type: "gelu" or "swiglu"
 
 
@@ -47,6 +51,68 @@ if torch.cuda.is_available():
 
 # ================================================================================================================================
 
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, base=10000.0, max_position_embeddings=1024):
+        """
+        Args:
+            dim: head dimension (e.g., 64 for a model with 512 embed and 8 heads)
+            base: controls the frequency range (10000 is standard from the paper)
+            max_position_embeddings: maximum sequence length to precompute
+        """
+        super().__init__()
+
+        self.dim = dim
+
+        # Compute inverse frequencies for each dimension pair
+        # Higher frequencies = faster rotation = captures local patterns
+        # Lower frequencies = slower rotation = captures global patterns
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim)) #  Shape: (dim/2,) e.g., (32,) for dim=64
+
+        # Compute position × frequency matrix
+        # For each position m and frequency f, compute: angle = m * f
+        t = torch.arange(max_position_embeddings, dtype=torch.float) # Shape: (max_pos,) e.g., (2048,)
+        
+        # This gives us the rotation angle for: - each position (row), - each dimension pair (column)
+        freqs = torch.einsum("i,j->ij", t, inv_freq) # freqs[m, i] = position_m * inv_freq_i, Shape: (max_pos, dim/2) e.g., (2048, 32)
+
+        # Duplicate frequencies for the cos/sin trick
+        emb = torch.cat((freqs, freqs), dim=-1) # Shape: (max_pos, dim) e.g., (2048, 64)
+
+        # Precompute and cache cos/sin values
+        # Both shapes: (1, 1, max_pos, dim)
+        # Will broadcast to (B, n_head, T, dim)
+        self.register_buffer(
+            "cos_cached", emb.cos()[None, None, :, :], persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", emb.sin()[None, None, :, :], persistent=False
+        )
+
+    def _rotate_half(self, x):
+        x1 = x[..., : x.shape[-1] // 2] # First half
+        x2 = x[..., x.shape[-1] // 2 :] # Second half
+        return torch.cat((-x2, x1), dim=-1)
+
+    def forward(self, q, k, seq_len=None):
+        """
+        Apply RoPE to q and k.
+
+        Args:
+            q, k: (B, n_head, T, head_dim)
+
+        Returns:
+            q_rotated, k_rotated: same shapes as input
+        """
+        if seq_len is None:
+            seq_len = q.size(-2)
+        # It is critical to match the dtype/device of q. Otherwise tensors
+        # become fp32 and Flash Attention may be disabled.
+        cos = self.cos_cached[..., :seq_len, :].to(dtype=q.dtype, device=q.device)
+        sin = self.sin_cached[..., :seq_len, :].to(dtype=q.dtype, device=q.device)
+        q2 = (q * cos) + (self._rotate_half(q) * sin)
+        k2 = (k * cos) + (self._rotate_half(k) * sin)
+        return q2, k2
+
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, config):
@@ -71,6 +137,19 @@ class CausalSelfAttention(nn.Module):
         # Creates the causal mask (lower triangular matrix). Saved with model but NOT a trainable parameter.
         self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
                             .view(1, 1, config.block_size, config.block_size))
+        
+        # RoPE configuration
+        self.use_rope = getattr(config, "use_rope", True)
+        if self.use_rope:
+            head_dim = config.n_embd // config.n_head
+            rope_base = getattr(config, "rope_base", 10000.0)
+            self.rotary_emb = RotaryEmbedding(
+                head_dim,
+                base=rope_base,
+                max_position_embeddings=config.block_size,
+            )
+        else:
+            self.rotary_emb = None
     
     def forward(self, x): # Multi-headed attention
         B, T, C = x.size() # B: batch size (how many sequences), T: sequence length (number of tokens), C: channels, embedding dimensionality (n_embd)
@@ -98,6 +177,10 @@ class CausalSelfAttention(nn.Module):
         # att = F.softmax(att, dim=-1)
         # # Weighted sum of values. Each token gets a weighted average of all values it's allowed to attend to.
         # y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) --> (B, nh, T, hs)
+
+        # apply RoPE to q, k
+        if self.rotary_emb is not None:
+            q, k = self.rotary_emb(q, k, seq_len=T)
 
         # Flash-attention implementation
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -171,10 +254,14 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embedding [B, T, 768]
-            wpe = nn.Embedding(config.block_size, config.n_embd), # word position embedding [B, T, 768]
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # hidden layers (a list of transformer blocks)
             ln_f = nn.RMSNorm(config.n_embd) # layer norm final after all transformer blocks
         ))
+        
+        # Only add wpe if NOT using RoPE
+        if not getattr(config, "use_rope", True):
+            self.transformer["wpe"] = nn.Embedding(config.block_size, config.n_embd)
+
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language modelling head, projects embeddings back to vocabulary logits [B, T, 50304]
 
@@ -202,12 +289,18 @@ class GPT(nn.Module):
         # Checks sequence isn't longer than context window
         assert T <= self.config.block_size, f"Cannot forward sequence of length {T},  block size is only {self.config.block_size}" 
         
-        # Forward the token and position embeddings
-        # We create new position indices, but reuse the learned embedding weights
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # sequential positions for the tokens in the current batch, shape: T
-        pos_emb = self.transformer.wpe(pos) # input: token positions, output: position embeddings for these tokens, shape: (T, n_embd)
-        tok_emb = self.transformer.wte(idx) # input: sequences of token ids, output: sequences of token embeddings, shape (B, T, n_embd)
-        x = tok_emb + pos_emb  # add token embeddings and position embeddings
+        # Forward the token embeddings
+        tok_emb = self.transformer.wte(idx)  # (B, T, n_embd)
+
+        if getattr(self.config, "use_rope", True):
+            # RoPE handles positional encoding in the attention layer
+            x = tok_emb
+        
+        else:
+            # Use learned absolute position embeddings. We create new position indices
+            pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # input: token positions, output: position embeddings for these tokens, shape: (T, n_embd)
+            pos_emb = self.transformer.wpe(pos)  # input: token positions, output: position embeddings for these tokens, shape: (T, n_embd)
+            x = tok_emb + pos_emb # add token embeddings and position embeddings
 
         # Forward the blocks of transformer
         # Each block processes the input sequentially. So we pass the input through e.g. 12 blocks in sequence.
@@ -238,57 +331,6 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
 
         return logits, loss
-
-    # This is a class method that loads pretrained GPT-2 weights from HuggingFace and transfers them into our custom GPT implementation. 
-    # It's how you can use OpenAI's trained weights instead of training from scratch. 
-    @classmethod
-    def from_pretrained(cls, model_type):
-        """Loads pretrained GPT-2 model weights from huggingface"""
-        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        from transformers import GPT2LMHeadModel
-        print("loading weights from pretrained gpt: %s" % model_type)
-
-        # n_layer, n_head and n_embd are determined from model_type
-        config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
-        }[model_type]
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        # create a from-scratch initialized minGPT model
-        config = GPTConfig(**config_args)
-        model = GPT(config)
-        sd = model.state_dict()
-        sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
-
-        # init a huggingface/transformers model
-        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
-        sd_hf = model_hf.state_dict()
-
-        # copy while ensuring all of the parameters are aligned and match in names and shapes
-        sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
-        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
-        # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
-        for k in sd_keys_hf:
-            if any(k.endswith(w) for w in transposed):
-                # special treatment for the Conv1D weights we need to transpose
-                assert sd_hf[k].shape[::-1] == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k].t())
-            else:
-                # vanilla copy over the other parameters
-                assert sd_hf[k].shape == sd[k].shape
-                with torch.no_grad():
-                    sd[k].copy_(sd_hf[k])
-
-        return model
     
     def configure_optimizers(self, weight_decay, learning_rate, device_type):
         # start with all of the candidate parameters (that require grad)
