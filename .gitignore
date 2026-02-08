@@ -17,6 +17,10 @@ __pycache__/
 edu_fineweb10B/
 edu_fineweb*/
 hellaswag/
+post-training/
+results/050226/img/Screenshot 2026-02-04 at 21.19.42.png
+results/050226/img/Screenshot 2026-02-04 at 21.24.21.png
+results/050226/img/Screenshot 2026-02-05 at 12.18.17.png
 
 # Training logs and checkpoints
 log/

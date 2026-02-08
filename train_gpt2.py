@@ -1,5 +1,3 @@
-# My GPT-2 124M implementation
-
 from dataclasses import dataclass
 import torch, math
 import torch.nn as nn
@@ -12,7 +10,7 @@ import tiktoken
 import numpy as np
 
 @dataclass
-class GPTConfig(): # Configuration of our transformer
+class GPTConfig():
     block_size: int = 1024 # maximum sequence length (context length)
     vocab_size: int = 50304 # number of tokens: 50,000 BPE merges + 256 tokens + 1 <|endoftext|> token = 50257 which is inefficient in terms of cuda processing, new vocab size 50304 could be easily divided by a lot of numbers
     n_layer: int = 12 # number of layers (transformer blocks: each block has attention + MLP + RMSNorms)
@@ -20,9 +18,9 @@ class GPTConfig(): # Configuration of our transformer
     n_embd: int = 768 # embedding dimension
 
     # additional options
-    use_rope: bool = True          # use RoPE embedding for training
+    use_rope: bool = True      # use RoPE embedding for training
     rope_base: float = 10000.0
-    mlp_type: str = "swiglu" # MLP activation type: "gelu" or "swiglu"
+    mlp_type: str = "swiglu"   # MLP activation type: "gelu" or "swiglu"
 
 
 # ========================================= Training parameters ==================================================================
@@ -36,13 +34,13 @@ total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
 B = 32 # ~16 GB of memory, ideally maximize to B = 32 (for ~28 GB in 32GB RTX 5090) or B = 64 (in more modern architectures e.g. A100 40/80GB)
 T = 1024 # sequence of length (context window size) for GPT-2, 2048 for GPT-3
 
-max_lr = 6e-4 * 3 # Another point for imporvement --> increase the lr up to x3
+max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
 warmup_steps = 285 # 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
-max_steps = 19073 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
+max_steps = 19073 * 2 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
 
 weight_decay = 0.1
-eval_steps = 500 # evaluate the model every 250 steps
+eval_steps = 250 # evaluate the model every 250 steps
 
 # Set the torch seed parameter
 torch.manual_seed(1337)
@@ -679,7 +677,7 @@ for step in range(max_steps):
         model.eval()
         num_return_sequences = 4
         max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = enc.encode("Hello, I'm a language model, ")
         tokens = torch.tensor(tokens, dtype=torch.long) # (8,)
         tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (5, 8)
         xgen = tokens.to(device)

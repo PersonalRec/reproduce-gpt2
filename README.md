@@ -23,14 +23,14 @@ This project is a near complete reproduction of the original GPT-2 124M foundati
 
 ## Results Achieved
 
-* **HellaSwag accuracy:** 0.28 (28%) vs. 0.294 (29.4%) original GPT-2
-* **Validation loss:** 3.26 vs. ~3.29 original GPT-2
+* **HellaSwag accuracy:** 0.32 (32%) vs. 0.294 (29.4%) original GPT-2
+* **Validation loss:** 2.99 vs. ~3.29 original GPT-2
 
 ### Training & Validation Loss Curve
 
-![Training and Validation Loss](results/230126/img/train-val_loss.png)
+![Training and Validation Loss](results/050226/results.png)
 
-The plot shows stable training convergence over ~19K steps with the model closely matching the original GPT-2 performance despite using only 10B tokens (GPT-2 was trained on much more data).
+The plot shows stable training convergence over ~38k steps (2 epochs) with the model surpassing g the original GPT-2 performance despite using only 10B tokens (GPT-2 was trained on much more data) and almost matching the GPT-3 124M on the HellaSwag eval. 
 
 ## Detailed Documentation
 
@@ -48,6 +48,10 @@ reproduce_gpt-2/
 ├── show_results.ipynb      # Final results visualisation
 ├── improvements_plan.md    # Potential improvements analysis
 ├── results/
+│   ├── 050226/
+│   │   ├── training_params.md   # Run with RoPE, SwiGLU, RMSNorm (2 epochs)
+│   │   └── img/
+│   │       └── train-val_loss.png
 │   └── 230126/
 │       ├── training_params.md   # Complete training parameters
 │       └── img/
