@@ -28,14 +28,15 @@ This project is a near complete reproduction of the original GPT-2 124M foundati
 
 ### Training & Validation Loss Curve
 
-![Training and Validation Loss](results/050226/results.png)
+![Training and Validation Loss](results/050226/img/train-val_loss.png)
 
 The plot shows stable training convergence over ~38k steps (2 epochs) with the model surpassing g the original GPT-2 performance despite using only 10B tokens (GPT-2 was trained on much more data) and almost matching the GPT-3 124M on the HellaSwag eval. 
 
 ## Detailed Documentation
 
 For complete training parameters, architecture details, and hyperparameters, see:
-- [`results/230126/training_params.md`](results/230126/training_params.md) - Full training configuration and results
+- [`results/050226/training_params.md`](results/050226/training_params.md) - Latest training run (RoPE + SwiGLU + RMSNorm, 2 epochs)
+- [`results/230126/training_params.md`](results/230126/training_params.md) - Initial training run (baseline GPT-2 reproduction)
 - [`improvements_plan.md`](improvements_plan.md) - Future improvements to the project
 
 ## Project Structure
