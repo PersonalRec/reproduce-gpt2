@@ -258,18 +258,18 @@ class GPT(nn.Module):
         
         # Only add wpe if NOT using RoPE
         if not getattr(config, "use_rope", True):
-            self.transformer["wpe"] = nn.Embedding(config.block_size, config.n_embd)
+            self.transformer["wpe"] = nn.Embedding(config.block_size, config.n_embd) # wpe --> learned word positional embedding tensor
 
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False) # language modelling head, projects embeddings back to vocabulary logits [B, T, 50304]
 
-        # weights sharing scheme
+        # Weights sharing scheme. We share the same embeddings tensor for the input (wte) and output (lm_head) of the transformer to save parameters and improve training
         self.transformer.wte.weight = self.lm_head.weight
 
         # Init params. Recursively walks through every module in the model (Linear layers, Embeddings, LayerNorms, etc.), applies _init_weights.
         self.apply(self._init_weights)
     
-    def _init_weights(self, module): # Weights & biases initialization according to the original GPT-2 paper. Possible improvement point #1: swithc from std=0.02 to Xavier/Glorot or Kaiming/He Initialization
+    def _init_weights(self, module): # Weights & biases initialization according to the original GPT-2 paper.
         if isinstance(module, nn.Linear):
             std = 0.02
             if hasattr(module, 'NANOGPT_SCALE_INIT'): # Fix variance growth in residual paths. Compensate for the accumulation across layers
@@ -305,8 +305,8 @@ class GPT(nn.Module):
         # Each block builds on what previous blocks learned. Early blocks: simple patterns (syntax, word relationships).
         # Middle blocks: medium complexity (phrases, local context). Late blocks: abstract patterns (semantics, global context).
         # Each block applies: 
-        # 1. LayerNorm → Self-Attention → Add residual
-        # 2. LayerNorm → MLP → Add residual
+        # 1. Normalize → Self-Attention → Add residual
+        # 2. Normalize → MLP → Add residual
         # Shape of the data stays the same, just the values change.
         for block in self.transformer.h:
             x = block(x)
@@ -336,6 +336,7 @@ class GPT(nn.Module):
         param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
         # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
         # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        # weight decay prevents overfitting by penalizing large weights to improve generalization and stabilize the training process
         decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
         nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
         optim_groups = [
@@ -352,6 +353,8 @@ class GPT(nn.Module):
         use_fused = fused_available and device_type == "cuda"
         if master_process:
             print(f"using fused AdamW: {use_fused}")
+        # eps --> small param to prevent division by 0, betas --> Momentum parameters, beta1 --> gradient momentum, beta2--> squared gradient momentum
+        # fused --> Combines multiple operations into single GPU kernel, ~20-30% faster on CUDA
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
 

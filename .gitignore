@@ -33,7 +33,7 @@ log*/
 eval_checkpoint.py
 input.txt
 ssh_commands.md
-notes.txt
+od_data_preparator.py
 
 # OS files
 .DS_Store

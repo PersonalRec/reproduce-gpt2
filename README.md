@@ -4,11 +4,22 @@ This project is a near complete reproduction of the original GPT-2 124M foundati
 
 ## Modern Improvements Applied
 
+### Training Infrastructure
 * **AdamW optimizer** - More robust weight decay implementation
 * **Flash Attention** - 2-3x faster than classical attention from the original GPT-2 paper
 * **bfloat16 dtype** - Mixed precision training for better memory efficiency
 * **Padded vocab size** (50304) - Better GPU utilization vs. original 50257
 * **torch.compile** - Additional PyTorch optimization speedup
+
+### Architecture Changes
+* **SwiGLU activation** - Replaced GELU with SwiGLU (used in LLaMA, PaLM) for improved model quality
+* **RoPE positional embeddings** - Replaced learned positional embeddings with Rotary Position Embeddings for better relative position encoding and length extrapolation
+* **RMSNorm** - Replaced LayerNorm with RMSNorm for ~40% faster normalization at equal performance
+
+### Training Regime
+* **Higher learning rate** - Increased LR up to 3x for faster convergence
+* **Multi-epoch training** - Extended training from 1 to multiple epochs for better data utilization
+* **Data shuffling** - Documents and shards are randomly permuted each epoch to avoid repeated ordering
 
 ## Training Configuration
 
@@ -37,7 +48,7 @@ The plot shows stable training convergence over ~38k steps (2 epochs) with the m
 For complete training parameters, architecture details, and hyperparameters, see:
 - [`results/050226/training_params.md`](results/050226/training_params.md) - Latest training run (RoPE + SwiGLU + RMSNorm, 2 epochs)
 - [`results/230126/training_params.md`](results/230126/training_params.md) - Initial training run (baseline GPT-2 reproduction)
-- [`improvements_plan.md`](improvements_plan.md) - Future improvements to the project
+- [`improvements_plan.md`](improvements_plan.md) - Completed and planned improvements
 
 ## Project Structure
 
