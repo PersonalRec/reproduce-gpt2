@@ -72,6 +72,11 @@ reproduce_gpt-2/
 
 ## Reproduction Steps
 
+0. **Set your GPU peak FLOPS** in `train_gpt2.py` for MFU calculation:
+   ```python
+   gpu_peak_flops = 209.5e12  # RTX 5090 bf16
+   ```
+
 1. **Prepare the dataset:**
    ```bash
    python fineweb.py

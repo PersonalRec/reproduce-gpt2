@@ -94,12 +94,12 @@ Add LayerNorm/RMSNorm right after (tok_embed + pos_embed)
 The embedding layer often has disproportionately large gradient norms compared to deeper layers, causing training instability. Adding normalization after the embedding "sandwiches" the input and brings gradient magnitudes in line with the rest of the network. This is a trivial 2-line change that requires no additional hyperparameters, adds negligible compute overhead, and can enable training with higher learning rates.
 
 
-### Implement realtime TensorBoard chart for Vast.ai
+### Implement realtime TensorBoard chart for Vast.ai (done)
 
 Helps track the model's training progress in real time with nice visualization
 
 
-### Model FLOPs Utilization (MFU)
+### Model FLOPs Utilization (MFU) (done)
 
 Measure MFU during training to find out how well my setup performs.
 

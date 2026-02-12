@@ -47,6 +47,13 @@ torch.manual_seed(1337)
 if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
+# per-GPU: B * grad_accum_steps sequences per step, 3x for fwd+bwd
+gpu_peak_flops = 209.5e12  # RTX 3090 bf16 tensor core TFLOPS
+
+# T4: 65 TFLOPS, No BF16 tensor support — use dtype=torch.float16 instead
+# RTX 3090 BF16:  142e12 (142 TFLOPS)
+# RTX 5090 BF16:  209.5e12 (142 TFLOPS)
+
 # ================================================================================================================================
 
 class RotaryEmbedding(nn.Module):
@@ -477,8 +484,8 @@ class DataLoaderLite:
         self._build_index()
         self.ptr = 0
 
+# ================================ HellaSwag eval helper function  ======================================================
 
-# helper function for HellaSwag eval
 # takes tokens, mask, and logits, returns the index of the completion with the lowest loss
 def get_most_likely_row(tokens, mask, logits):
     # evaluate the autoregressive loss at all positions
@@ -586,6 +593,40 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
     return min_lr + coeff * (max_lr - min_lr)
 
+
+
+# ================================================ Flops Calculator ===========================================================
+
+def deepmind_flops_per_sequence(n_layers, n_heads, d_model, n_ctx, n_vocab, ff_ratio=4):
+    """DeepMind method for forwad pass FLOPs counting of decoder-only Transformer
+    """
+    d_attn = d_model // n_heads
+    d_ff = d_model * ff_ratio
+ 
+    embeddings = 2 * n_ctx * n_vocab * d_model
+ 
+    attn_qkv = 2 * n_ctx * 3 * d_model * (d_attn * n_heads)
+    attn_logits = 2 * n_ctx * n_ctx * (d_attn * n_heads)
+    attn_softmax = 3 * n_heads * n_ctx * n_ctx
+    attn_reduce = 2 * n_ctx * n_ctx * (d_attn * n_heads)
+    attn_project = 2 * n_ctx * (d_attn * n_heads) * d_model
+    total_attn = attn_qkv + attn_logits + attn_softmax + attn_reduce + attn_project
+ 
+    ff = 2 * n_ctx * (d_model * d_ff + d_model * d_ff)
+ 
+    logits = 2 * n_ctx * d_model * n_vocab
+ 
+    return embeddings + n_layers * (total_attn + ff) + logits
+
+
+# FLOPs calculation (once, before training loop)
+flops_per_seq_fwd = deepmind_flops_per_sequence(
+    n_layers=GPTConfig.n_layer, n_heads=GPTConfig.n_head,
+    d_model=GPTConfig.n_embd, n_ctx=GPTConfig.block_size,
+    n_vocab=GPTConfig.vocab_size, ff_ratio=4
+)
+
+
 # ======================================= Configure the optimizer and a logger ===============================================
 
 optimizer = raw_model.configure_optimizers(weight_decay=weight_decay, learning_rate=max_lr, device_type=device_type)
@@ -596,6 +637,11 @@ os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, f"log.txt") # record the losses
 with open(log_file, "w") as f: # open wor writing to clear the file
     pass
+
+# TensorBoard writer (master process only)
+if master_process:
+    from torch.utils.tensorboard import SummaryWriter
+    tb_writer = SummaryWriter(log_dir=os.path.join(log_dir, "tensorboard"))
 
 # ======================================= Optimization loop =================================================================
 
@@ -628,6 +674,7 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            tb_writer.add_scalar("loss/val", val_loss_accum.item(), step)
             if step > 0 and (step % 5000 == 0 or last_step):
                 # optionally write model checkpoints
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
@@ -674,7 +721,49 @@ for step in range(max_steps):
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} hella {acc_norm:.4f}\n")
-
+            tb_writer.add_scalar("eval/hellaswag", acc_norm, step)
+                
+    
+    # Training loop
+    model.train()
+    optimizer.zero_grad()
+    loss_accum = 0.0
+    # Gradient accumulation for around 0.5M tokens
+    for micro_step in range(grad_accum_steps):
+        x, y = train_loader.next_batch() # get the next batch
+        x, y = x.to(device), y.to(device) # move the tensors to the device
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16): # Cast our dtype to bfloat16
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # normalize the loss
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # require_backward_grad_sync will only turn on on the last micro_step to sync the gradients
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # average the losses across all gpu processes
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # calculates the global norm of the parameters. Prevents too big gradient shock. Global gradient clipping.
+    # determine and set the learning rate for this iteration
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    optimizer.step()
+    if device_type == "cuda":
+        torch.cuda.synchronize() # wait for the GPU to finish work
+    t1 = time.time()
+    dt = (t1 - t0) # times difference in seconds
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
+    tokens_per_sec = tokens_processed / dt
+    mfu = (flops_per_seq_fwd * B * grad_accum_steps * 3) / (dt * gpu_peak_flops)
+    if master_process:
+        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | mfu: {mfu:.2%}")
+        with open(log_file, "a") as f:
+            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        tb_writer.add_scalar("loss/train", loss_accum.item(), step)
+        tb_writer.add_scalar("training/lr", lr, step)
+        tb_writer.add_scalar("training/grad_norm", norm, step)
+        tb_writer.add_scalar("training/tokens_per_sec", tokens_per_sec, step)
+        tb_writer.add_scalar("training/mfu", mfu, step)
+    
     # Generate from the model on the last step
     if last_step and master_process:
         model.eval()
@@ -714,42 +803,11 @@ for step in range(max_steps):
             tokens = xgen[i, :max_length].tolist() # Gets sequence i, first max_length tokens. Converts tensor to Python list.
             decoded = enc.decode(tokens) # Converts token IDs back to text.
             print(">", decoded)
-                
-    
-    # Training loop
-    model.train()
-    optimizer.zero_grad()
-    loss_accum = 0.0
-    # Gradient accumulation for around 0.5M tokens
-    for micro_step in range(grad_accum_steps):
-        x, y = train_loader.next_batch() # get the next batch
-        x, y = x.to(device), y.to(device) # move the tensors to the device
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16): # Cast our dtype to bfloat16
-            logits, loss = model(x, y)
-        loss = loss / grad_accum_steps # normalize the loss
-        loss_accum += loss.detach()
-        if ddp:
-            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # require_backward_grad_sync will only turn on on the last micro_step to sync the gradients
-        loss.backward()
-    if ddp:
-        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # average the losses across all gpu processes
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # calculates the global norm of the parameters. Prevents too big gradient shock. Global gradient clipping.
-    # determine and set the learning rate for this iteration
-    lr = get_lr(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    optimizer.step()
-    if device_type == "cuda":
-        torch.cuda.synchronize() # wait for the GPU to finish work
-    t1 = time.time()
-    dt = (t1 - t0) # times difference in seconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
-    tokens_per_sec = tokens_processed / dt
-    if master_process:
-        print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
 
+
+# Close TensorBoard writer
+if master_process:
+    tb_writer.close()
 
 # Destroy the process group after train end
 if ddp:

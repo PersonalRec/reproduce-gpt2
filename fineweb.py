@@ -4,9 +4,11 @@ https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu
 Downloads and tokenizes the data and saves data shards to disk.
 Run simply as:
 $ python fineweb.py
+$ python fineweb.py --test  # tiny dataset for testing (e.g. TensorBoard)
 Will save shards to the local directory "edu_fineweb10B".
 """
 
+import argparse
 import os
 
 # Fixing of the HuggingFace issue with slow dataset downloading 
@@ -30,9 +32,18 @@ except ImportError:
     pass  # dotenv not installed, will use system env vars
 
 # ------------------------------------------
-local_dir = "edu_fineweb10B"
+parser = argparse.ArgumentParser()
+parser.add_argument("--test", action="store_true", help="Download a tiny dataset subset for quick testing")
+args, _ = parser.parse_known_args()
+
+if args.test:
+    local_dir = "edu_fineweb10B"
+    print("TEST MODE: downloading tiny dataset subset")
+else:
+    local_dir = "edu_fineweb10B"
+    shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
+
 remote_name = "sample-10BT"
-shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
 
 # create the cache the local directory if it doesn't exist yet
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
@@ -54,8 +65,32 @@ def tokenize(doc):
 def write_datafile(filename, tokens_np):
     np.save(filename, tokens_np)
 
+def download_test_dataset():
+    """Download tiny Shakespeare and save as shards in the same format as FineWeb."""
+    import urllib.request
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    print("Downloading tiny Shakespeare dataset...")
+    text = urllib.request.urlopen(url).read().decode('utf-8')
+    tokens = enc.encode_ordinary(text)
+    tokens = np.array([eot] + tokens, dtype=np.uint16)
+    print(f"Tokenized: {len(tokens)} tokens")
+
+    # Split 90/10 into train/val and save as shards
+    split_idx = int(len(tokens) * 0.9)
+    for split, data in [("val", tokens[split_idx:]), ("train", tokens[:split_idx])]:
+        filename = os.path.join(DATA_CACHE_DIR, f"edufineweb_{split}_000000")
+        write_datafile(filename, data)
+        print(f"Saved {split} shard: {len(data)} tokens -> {filename}.npy")
+
+
 # Guard for multiprocessing on macOS (spawn method)
 if __name__ == '__main__':
+
+    # Test mode: use tiny Shakespeare instead of FineWeb
+    if args.test:
+        download_test_dataset()
+        exit()
+
     # Get HuggingFace token from environment variable if available
     # This enables faster downloads for authenticated users
     hf_token = os.environ.get('HF_TOKEN', None)
