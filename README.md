@@ -23,14 +23,14 @@ This project is a near complete reproduction of the original GPT-2 124M foundati
 
 ## Training Configuration
 
-* **GPU:** 4x RTX 3090 (24 GB) rented on Vast.ai
-* **Training time:** ~11 hours
-* **Training cost:** ~$7 USD
+* **GPU:** 2x RTX 5090 (32 GB) rented on Vast.ai
+* **Training time:** ~17 hours
+* **Training cost:** ~$11 USD
 * **Framework**: PyTorch with DDP (DistributedDataParallel)
 * **Base implementation:** Andrej Karpathy's build-nanoGPT repo
 * **Dataset:** FineWeb-Edu 10B tokens
 * **Batch size:** 524,288 tokens per step (~0.5M)
-* **Total steps:** 19,073 steps (1 epoch)
+* **Total steps:** 19,073 x 2 steps (2 epochs)
 
 ## Results Achieved
 
@@ -57,7 +57,7 @@ reproduce_gpt-2/
 ├── train_gpt2.py           # Main training script
 ├── fineweb.py              # Dataset preparation script
 ├── hellaswag.py            # HellaSwag evaluation utilities
-├── show_results.ipynb      # Final results visualisation
+├── show_results.py            # Results visualisation (saves to results/)
 ├── improvements_plan.md    # Potential improvements analysis
 ├── results/
 │   ├── 050226/
@@ -79,7 +79,7 @@ reproduce_gpt-2/
 
 2. **Train the model (multi-GPU):**
    ```bash
-   torchrun --standalone --nproc_per_node=4 train_gpt2.py
+   torchrun --standalone --nproc_per_node=2 train_gpt2.py
    ```
 
 3. **Monitor training:**
