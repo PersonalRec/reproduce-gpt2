@@ -22,6 +22,7 @@ class GPTConfig():
     use_rope: bool = True      # use RoPE embedding for training
     rope_base: float = 10000.0
     mlp_type: str = "swiglu"   # MLP activation type: "gelu" or "swiglu"
+    dropout: float = 0.0
 
 
 # ========================================= Training parameters ==================================================================
@@ -139,6 +140,8 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.dropout = config.dropout
+        self.resid_dropout = nn.Dropout(p=config.dropout)
 
         # Creates the causal mask (lower triangular matrix). Saved with model but NOT a trainable parameter.
         self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
@@ -189,12 +192,13 @@ class CausalSelfAttention(nn.Module):
             q, k = self.rotary_emb(q, k, seq_len=T)
 
         # Flash-attention implementation
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, dropout_p=self.dropout if self.training else 0.0) # added dropout for the training phase
 
         # Reassembles multi-head outputs, concatenates side-by-side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
         y = self.c_proj(y)
+        y = self.resid_dropout(y)
 
         return y
  
@@ -204,6 +208,7 @@ class MLP(nn.Module):
 
         mlp_type = getattr(config, "mlp_type", "gelu")
         self.mlp_type = mlp_type
+        self.resid_dropout = nn.Dropout(p=config.dropout)
 
         # SwiGLU MLP
         if mlp_type == "swiglu":
@@ -236,6 +241,9 @@ class MLP(nn.Module):
             x = self.c_fc(x)
             x = self.gelu(x)
             x = self.c_proj(x)
+        
+        x = self.resid_dropout(x)
+
         return x
 
 class Block(nn.Module):
