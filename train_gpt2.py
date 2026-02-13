@@ -258,8 +258,12 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x)) # Normalize → Attention → Add residual
-        x = x + self.mlp(self.ln_2(x))  # Normalize → MLP → Add residual
+        # x = x + self.attn(self.ln_1(x)) # Normalize → Attention → Add residual
+        # x = x + self.mlp(self.ln_2(x))  # Normalize → MLP → Add residual
+
+        # Parallel attention + MLP instead of sequential implementation
+        x = x + self.attn(self.ln_1(x)) + self.mlp(self.ln_1(x))
+
         return x
 
 class GPT(nn.Module):
