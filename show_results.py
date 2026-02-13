@@ -62,7 +62,7 @@ def load_log_txt(log_path):
 
 def load_log_csv(log_path):
     """Load new CSV log format with columns:
-    step, train_loss, val_loss, hellaswag, lr, grad_norm, tokens_per_sec, mfu, dt_ms
+    step, train_loss, val_loss, hellaswag, mmlu, lr, grad_norm, tokens_per_sec, mfu, dt_ms
     Returns a dict of streams matching the legacy format for compatibility.
     """
     df = pd.read_csv(log_path)
@@ -85,6 +85,12 @@ def load_log_csv(log_path):
         hella_data = df[["step", "hellaswag"]].dropna(subset=["hellaswag"])
         if not hella_data.empty:
             streams["hella"] = dict(zip(hella_data["step"].astype(int), hella_data["hellaswag"].astype(float)))
+
+    # MMLU accuracy (only on eval steps)
+    if "mmlu" in df.columns:
+        mmlu_data = df[["step", "mmlu"]].dropna(subset=["mmlu"])
+        if not mmlu_data.empty:
+            streams["mmlu"] = dict(zip(mmlu_data["step"].astype(int), mmlu_data["mmlu"].astype(float)))
 
     # Additional metrics (unique to CSV format)
     for col in ["lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]:

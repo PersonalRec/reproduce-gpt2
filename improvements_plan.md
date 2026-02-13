@@ -2,12 +2,6 @@
 
 I will try to squeeze the most of this model, trying to keep the number of model's parameters as small as possible. I will mainly focus on architecture improvements, better datasets, etc. rather than direct scaling to see how far can we push this architecture with modern techniques while keeping parameter count as small as possible. Another important point: trying to minimize the training cost while keeping the model training efficient.
 
-### Weight Initialization
-
-Switch from std=0.02 to Xavier/Glorot or Kaiming/He Initialization
-
-Better weight initialization helps with training stability and convergence speed. Xavier works well for tanh/sigmoid, while Kaiming/He is better for ReLU-like activations. Can reduce vanishing/exploding gradients and lead to faster convergence especially in deeper networks.
-
 
 ### SwiGLU Activation Function (done)
 
@@ -30,7 +24,7 @@ Implement RoPE (rotary positional embeddings, LLaMA-style) instead of learned po
 RoPE encodes relative positions through rotation in embedding space, enabling better length extrapolation (can handle sequences longer than training length). More parameter-efficient than learned embeddings. Used in LLaMA, GPT-NeoX, and shown to improve long-context understanding.
 
 
-### Adding dropout layers
+### Adding dropout layers (done)
 
 Current implementation from Karpathy does not have any dropout layers in comparison to the original GPT-2 paper. At this point we do not see any overfitting, but later we might consider to add dropout to prevent this (p=0.1).
 
@@ -68,7 +62,9 @@ Try to use more recent and more effective tokenizers.
 Better tokenizers (like SentencePiece, BPE with larger vocab, or modern tiktoken variants) can reduce sequence lengths (fewer tokens for same text = faster training/inference), better handle multilingual text, and improve model efficiency.
 
 
-### Additional Evaluation Benchmarks
+### Additional Evaluation Benchmarks (done)
+
+(Added MMLU)
 
 Add more evals in addition to HellaSwag, e.g. Eleuther Evaluation Harness
 
@@ -109,3 +105,12 @@ Measure MFU during training to find out how well my setup performs.
 Take completely new dataset and post-train the pre-trained model on it.
 
 ### Make a chat-model
+
+
+### Weight Initialization
+
+(probably will not be implemented since the current implementation is good enough)
+
+Switch from std=0.02 to Xavier/Glorot or Kaiming/He Initialization
+
+Better weight initialization helps with training stability and convergence speed. Xavier works well for tanh/sigmoid, while Kaiming/He is better for ReLU-like activations. Can reduce vanishing/exploding gradients and lead to faster convergence especially in deeper networks.

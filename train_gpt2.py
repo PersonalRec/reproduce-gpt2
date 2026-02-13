@@ -7,6 +7,7 @@ import inspect
 import os
 import csv
 from hellaswag import render_example, iterate_examples
+from mmlu import render_example as mmlu_render_example, iterate_examples as mmlu_iterate_examples
 import tiktoken
 import numpy as np
 
@@ -22,7 +23,7 @@ class GPTConfig():
     use_rope: bool = True      # use RoPE embedding for training
     rope_base: float = 10000.0
     mlp_type: str = "swiglu"   # MLP activation type: "gelu" or "swiglu"
-    dropout: float = 0.0
+    dropout: float = 0.1
 
 
 # ========================================= Training parameters ==================================================================
@@ -30,6 +31,7 @@ class GPTConfig():
 torch.set_float32_matmul_precision('high')
 
 use_compile = True # Using of torch.compile() to speed up the training process
+checkpointer_steps = 10000
 
 # Gradient accumulation parameters
 total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
@@ -38,11 +40,11 @@ T = 1024 # sequence of length (context window size) for GPT-2, 2048 for GPT-3
 
 max_lr = 6e-4 * 3
 min_lr = max_lr * 0.1
-warmup_steps = 285 # 715 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
-max_steps = 19073 * 2 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps. Another point for improvement: increase the number of steps by e.g. 4 times (4 epochs) to get better results
+warmup_steps = 715 / 2 # 375e6 / 2**19 (warmup during 375M tokens) / (0.5M tokens in a batch) = 715 steps
+max_steps = 19073 * 3 # 10 trillion tokens / 2**19 (0.5M tokens in a batch) = 19,073 steps per epoch.
 
 weight_decay = 0.1
-eval_steps = 250 # evaluate the model every 250 steps
+eval_steps = 500 # evaluate the model every 250 steps
 
 # Set the torch seed parameter
 torch.manual_seed(1337)
@@ -648,7 +650,7 @@ log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "log.csv")
 # Write CSV header
-csv_columns = ["step", "train_loss", "val_loss", "hellaswag", "lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]
+csv_columns = ["step", "train_loss", "val_loss", "hellaswag", "mmlu", "lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]
 with open(log_file, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(csv_columns)
@@ -670,6 +672,7 @@ for step in range(max_steps):
     # Initialize per-step metrics (None = not computed this step)
     step_val_loss = None
     step_hellaswag = None
+    step_mmlu = None
 
     # Once in a while evaluate our validation loss
     if step % eval_steps == 0 or last_step:
@@ -694,7 +697,7 @@ for step in range(max_steps):
         if master_process:
             print(f"validation loss: {step_val_loss:.4f}")
             tb_writer.add_scalar("loss/val", step_val_loss, step)
-            if step > 0 and (step % 5000 == 0 or last_step):
+            if step > 0 and (step % checkpointer_steps == 0 or last_step):
                 # write model checkpoints (includes optimizer state for resuming pre-training)
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
@@ -745,11 +748,46 @@ for step in range(max_steps):
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
             tb_writer.add_scalar("eval/hellaswag", acc_norm, step)
-                
-    
+
+    # Once in a while evaluate MMLU (curated subjects)
+    if step % eval_steps == 0 or last_step:
+        mmlu_correct = 0
+        mmlu_total = 0
+        for i, (subject, row) in enumerate(mmlu_iterate_examples("test")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            tokens, mask, label = mmlu_render_example(subject, row)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = get_most_likely_row(tokens, mask, logits)
+            mmlu_total += 1
+            mmlu_correct += int(pred_norm == label)
+        
+        # reduce the stats across all processes
+        if ddp:
+            mmlu_total = torch.tensor(mmlu_total, dtype=torch.long, device=device)
+            mmlu_correct = torch.tensor(mmlu_correct, dtype=torch.long, device=device)
+            dist.all_reduce(mmlu_total, op=dist.ReduceOp.SUM)
+            dist.all_reduce(mmlu_correct, op=dist.ReduceOp.SUM)
+            mmlu_total = mmlu_total.item()
+            mmlu_correct = mmlu_correct.item()
+        mmlu_acc = mmlu_correct / mmlu_total
+        step_mmlu = mmlu_acc
+        if master_process:
+            print(f"MMLU accuracy: {mmlu_correct}/{mmlu_total}={mmlu_acc:.4f}")
+            tb_writer.add_scalar("eval/mmlu", mmlu_acc, step)
+
     # Training loop
+
     model.train()
     optimizer.zero_grad()
+
     loss_accum = 0.0
     # Gradient accumulation for around 0.5M tokens
     for micro_step in range(grad_accum_steps):
@@ -762,21 +800,30 @@ for step in range(max_steps):
         if ddp:
             model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1) # require_backward_grad_sync will only turn on on the last micro_step to sync the gradients
         loss.backward()
+
     if ddp:
         dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG) # average the losses across all gpu processes
+
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # calculates the global norm of the parameters. Prevents too big gradient shock. Global gradient clipping.
+   
     # determine and set the learning rate for this iteration
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
+
     optimizer.step()
+
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
+
+    # Calculate statistics
     t1 = time.time()
     dt = (t1 - t0) # times difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     mfu = (flops_per_seq_fwd * B * grad_accum_steps * 3) / (dt * gpu_peak_flops)
+
+    # Write/show the statistics
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | mfu: {mfu:.2%}")
         # Write a single CSV row with all metrics for this step
@@ -787,6 +834,7 @@ for step in range(max_steps):
                 f"{loss_accum.item():.6f}",
                 f"{step_val_loss:.4f}" if step_val_loss is not None else "",
                 f"{step_hellaswag:.4f}" if step_hellaswag is not None else "",
+                f"{step_mmlu:.4f}" if step_mmlu is not None else "",
                 f"{lr:.6e}",
                 f"{norm:.4f}",
                 f"{tokens_per_sec:.2f}",
