@@ -87,7 +87,7 @@ The dataset size should be x20 bigger than the model's parameters count.
 Try to do initial model reining (e.g. during the warmup) using baby-books so the models will be able to learn language patterns (hopefully) faster.
 
 
-### Dual PatchNorm (Post-Embedding Normalization)
+### Dual PatchNorm (Post-Embedding Normalization) (done)
 
 Add LayerNorm/RMSNorm right after (tok_embed + pos_embed)
 

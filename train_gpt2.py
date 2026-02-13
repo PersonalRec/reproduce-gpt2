@@ -261,6 +261,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd), # word token embedding [B, T, 768]
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]), # hidden layers (a list of transformer blocks)
+            dpn = nn.RMSNorm(config.n_embd), # added another normalization step for the DualPatchNorm
             ln_f = nn.RMSNorm(config.n_embd) # layer norm final after all transformer blocks
         ))
         
@@ -307,6 +308,8 @@ class GPT(nn.Module):
             pos = torch.arange(0, T, dtype=torch.long, device=idx.device) # input: token positions, output: position embeddings for these tokens, shape: (T, n_embd)
             pos_emb = self.transformer.wpe(pos)  # input: token positions, output: position embeddings for these tokens, shape: (T, n_embd)
             x = tok_emb + pos_emb # add token embeddings and position embeddings
+        
+        x = self.transformer.dpn(x) # DualPatchNorm: Apply RMSnorm after positional embedding
 
         # Forward the blocks of transformer
         # Each block processes the input sequentially. So we pass the input through e.g. 12 blocks in sequence.
