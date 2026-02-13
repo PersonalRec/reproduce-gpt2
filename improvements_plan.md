@@ -64,7 +64,7 @@ Better tokenizers (like SentencePiece, BPE with larger vocab, or modern tiktoken
 
 ### Additional Evaluation Benchmarks (done)
 
-(Added MMLU)
+(Added MMLU and ARC)
 
 Add more evals in addition to HellaSwag, e.g. Eleuther Evaluation Harness
 

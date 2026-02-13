@@ -6,8 +6,7 @@ import time
 import inspect
 import os
 import csv
-from hellaswag import render_example, iterate_examples
-from mmlu import render_example as mmlu_render_example, iterate_examples as mmlu_iterate_examples
+from evals import hellaswag, mmlu, arc
 import tiktoken
 import numpy as np
 
@@ -32,6 +31,11 @@ torch.set_float32_matmul_precision('high')
 
 use_compile = True # Using of torch.compile() to speed up the training process
 checkpointer_steps = 10000
+
+# Evaluation benchmarks to run (set to False to skip)
+run_hellaswag = True
+run_mmlu = True
+run_arc = True
 
 # Gradient accumulation parameters
 total_batch_size = 524288 # 2**19, ~0.5M in number of tokens
@@ -502,29 +506,6 @@ class DataLoaderLite:
         self._build_index()
         self.ptr = 0
 
-# ================================ HellaSwag eval helper function  ======================================================
-
-# takes tokens, mask, and logits, returns the index of the completion with the lowest loss
-def get_most_likely_row(tokens, mask, logits):
-    # evaluate the autoregressive loss at all positions
-    shift_logits = (logits[..., :-1, :]).contiguous()
-    shift_tokens = (tokens[..., 1:]).contiguous()
-    flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-    flat_shift_tokens = shift_tokens.view(-1)
-    shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
-    shift_losses = shift_losses.view(tokens.size(0), -1)
-    # now get the average loss just for the completion region (where mask == 1), in each row
-    shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
-    masked_shift_losses = shift_losses * shift_mask
-    # sum and divide by the number of 1s in the mask
-    sum_loss = masked_shift_losses.sum(dim=1)
-    avg_loss = sum_loss / shift_mask.sum(dim=1)
-    # now we have a loss for each of the 4 completions
-    # the one with the lowest loss should be the most likely
-    pred_norm = avg_loss.argmin().item()
-    return pred_norm
-
-
 # ================================ DDP Training Settings ==============================================================
 
 # run the training loop
@@ -654,7 +635,7 @@ log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "log.csv")
 # Write CSV header
-csv_columns = ["step", "train_loss", "val_loss", "hellaswag", "mmlu", "lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]
+csv_columns = ["step", "train_loss", "val_loss", "hellaswag", "mmlu", "arc", "lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]
 with open(log_file, "w", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(csv_columns)
@@ -677,8 +658,9 @@ for step in range(max_steps):
     step_val_loss = None
     step_hellaswag = None
     step_mmlu = None
+    step_arc = None
 
-    # Once in a while evaluate our validation loss
+    # Once in a while evaluate our validation loss and benchmarks
     if step % eval_steps == 0 or last_step:
         model.eval()
         val_loader.reset()
@@ -718,74 +700,23 @@ for step in range(max_steps):
                 if device_type == "cuda":
                     checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state(device)
                 torch.save(checkpoint, checkpoint_path)
-    
-    # Once in a while evaluate HellaSwag
-    if step % eval_steps == 0 or last_step:
-        num_correct_norm = 0
-        num_total = 0
-        for i, example in enumerate(iterate_examples("val")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            _, tokens, mask, label = render_example(example)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            num_total += 1
-            num_correct_norm += int(pred_norm == label)
         
-        # reduce the stats across all processes
-        if ddp:
-            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
-            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
-            dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)
-            num_total = num_total.item()
-            num_correct_norm = num_correct_norm.item()
-        acc_norm = num_correct_norm / num_total
-        step_hellaswag = acc_norm
-        if master_process:
-            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            tb_writer.add_scalar("eval/hellaswag", acc_norm, step)
+        # Evaluate benchmarks (each handles DDP internally and prints results on master)
+        
+        if run_hellaswag:
+            step_hellaswag = hellaswag.evaluate(model, device, device_type, ddp, ddp_rank, ddp_world_size)
+            if master_process:
+                tb_writer.add_scalar("eval/hellaswag", step_hellaswag, step)
 
-    # Once in a while evaluate MMLU (curated subjects)
-    if step % eval_steps == 0 or last_step:
-        mmlu_correct = 0
-        mmlu_total = 0
-        for i, (subject, row) in enumerate(mmlu_iterate_examples("test")):
-            # only process examples where i % ddp_world_size == ddp_rank
-            if i % ddp_world_size != ddp_rank:
-                continue
-            # render the example into tokens and labels
-            tokens, mask, label = mmlu_render_example(subject, row)
-            tokens = tokens.to(device)
-            mask = mask.to(device)
-            # get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(tokens)
-                pred_norm = get_most_likely_row(tokens, mask, logits)
-            mmlu_total += 1
-            mmlu_correct += int(pred_norm == label)
-        
-        # reduce the stats across all processes
-        if ddp:
-            mmlu_total = torch.tensor(mmlu_total, dtype=torch.long, device=device)
-            mmlu_correct = torch.tensor(mmlu_correct, dtype=torch.long, device=device)
-            dist.all_reduce(mmlu_total, op=dist.ReduceOp.SUM)
-            dist.all_reduce(mmlu_correct, op=dist.ReduceOp.SUM)
-            mmlu_total = mmlu_total.item()
-            mmlu_correct = mmlu_correct.item()
-        mmlu_acc = mmlu_correct / mmlu_total
-        step_mmlu = mmlu_acc
-        if master_process:
-            print(f"MMLU accuracy: {mmlu_correct}/{mmlu_total}={mmlu_acc:.4f}")
-            tb_writer.add_scalar("eval/mmlu", mmlu_acc, step)
+        if run_mmlu:
+            step_mmlu = mmlu.evaluate(model, device, device_type, ddp, ddp_rank, ddp_world_size)
+            if master_process:
+                tb_writer.add_scalar("eval/mmlu", step_mmlu, step)
+
+        if run_arc:
+            step_arc = arc.evaluate(model, device, device_type, ddp, ddp_rank, ddp_world_size)
+            if master_process:
+                tb_writer.add_scalar("eval/arc", step_arc, step)
 
     # Training loop
 
@@ -839,6 +770,7 @@ for step in range(max_steps):
                 f"{step_val_loss:.4f}" if step_val_loss is not None else "",
                 f"{step_hellaswag:.4f}" if step_hellaswag is not None else "",
                 f"{step_mmlu:.4f}" if step_mmlu is not None else "",
+                f"{step_arc:.4f}" if step_arc is not None else "",
                 f"{lr:.6e}",
                 f"{norm:.4f}",
                 f"{tokens_per_sec:.2f}",

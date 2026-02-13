@@ -62,7 +62,7 @@ def load_log_txt(log_path):
 
 def load_log_csv(log_path):
     """Load new CSV log format with columns:
-    step, train_loss, val_loss, hellaswag, mmlu, lr, grad_norm, tokens_per_sec, mfu, dt_ms
+    step, train_loss, val_loss, hellaswag, mmlu, arc, lr, grad_norm, tokens_per_sec, mfu, dt_ms
     Returns a dict of streams matching the legacy format for compatibility.
     """
     df = pd.read_csv(log_path)
@@ -80,17 +80,12 @@ def load_log_csv(log_path):
         if not val_data.empty:
             streams["val"] = dict(zip(val_data["step"].astype(int), val_data["val_loss"].astype(float)))
 
-    # HellaSwag accuracy (only on eval steps)
-    if "hellaswag" in df.columns:
-        hella_data = df[["step", "hellaswag"]].dropna(subset=["hellaswag"])
-        if not hella_data.empty:
-            streams["hella"] = dict(zip(hella_data["step"].astype(int), hella_data["hellaswag"].astype(float)))
-
-    # MMLU accuracy (only on eval steps)
-    if "mmlu" in df.columns:
-        mmlu_data = df[["step", "mmlu"]].dropna(subset=["mmlu"])
-        if not mmlu_data.empty:
-            streams["mmlu"] = dict(zip(mmlu_data["step"].astype(int), mmlu_data["mmlu"].astype(float)))
+    # Eval benchmarks (only on eval steps)
+    for col, key in [("hellaswag", "hella"), ("mmlu", "mmlu"), ("arc", "arc")]:
+        if col in df.columns:
+            col_data = df[["step", col]].dropna(subset=[col])
+            if not col_data.empty:
+                streams[key] = dict(zip(col_data["step"].astype(int), col_data[col].astype(float)))
 
     # Additional metrics (unique to CSV format)
     for col in ["lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]:

@@ -31,8 +31,10 @@ from tqdm import tqdm
 import torch
 from torch.nn import functional as F
 
+from evals import evaluate_benchmark
+
 # -----------------------------------------------------------------------------
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "mmlu")
+DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "..", "mmlu")
 
 enc = tiktoken.get_encoding("gpt2")
 
@@ -122,7 +124,7 @@ def format_subject(subject):
 
 def render_example(subject, row):
     """
-    Given a subject and a CSV row, render it as torch tensors matching the HellaSwag interface:
+    Given a subject and a CSV row, render it as torch tensors:
     - tokens (the tokens of context + completion, of size 4xN, as there are always 4 candidates)
     - mask (is 1 in the region of the candidate completion, where we evaluate likelihoods)
     - label (the index of the correct completion, which we hope has the highest likelihood)
@@ -193,56 +195,37 @@ def iterate_examples(split, subjects=None):
                     yield subject, row
 
 
-@torch.no_grad()
-def evaluate(model_type, device):
-    """Standalone evaluation using a HuggingFace GPT-2 model (for testing)."""
-    from transformers import GPT2LMHeadModel
-
-    torch.set_float32_matmul_precision("high")
-    model = GPT2LMHeadModel.from_pretrained(model_type)
-    model.to(device)
-
-    num_correct = 0
-    num_total = 0
-
-    for subject, row in iterate_examples("test"):
-        tokens, mask, label = render_example(subject, row)
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-
-        # Get logits
-        logits = model(tokens).logits
-
-        # Evaluate the autoregressive loss at all positions
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction="none")
-        shift_losses = shift_losses.view(tokens.size(0), -1)
-
-        # Get the average loss just for the completion region (where mask == 1)
-        shift_mask = (mask[..., 1:]).contiguous()
-        masked_shift_losses = shift_losses * shift_mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-
-        # Pick the completion with the lowest average loss
-        pred_norm = avg_loss.argmin().item()
-
-        num_total += 1
-        num_correct += int(pred_norm == label)
-
-        if num_total % 50 == 0:
-            print(f"MMLU {num_total} acc={num_correct / num_total:.4f}")
-
-    acc = num_correct / num_total
-    print(f"\nMMLU accuracy: {num_correct}/{num_total} = {acc:.4f}")
-    return acc
+def _render_for_eval(example):
+    """Adapter: iterate_examples yields (subject, row), render_example needs both."""
+    subject, row = example
+    return render_example(subject, row)
 
 
+def evaluate(model, device, device_type, ddp, ddp_rank, ddp_world_size):
+    """
+    Evaluate the model on MMLU (curated subjects) test set.
+
+    Returns:
+        accuracy (float) -- normalized accuracy
+    """
+    return evaluate_benchmark(
+        model=model,
+        device=device,
+        device_type=device_type,
+        ddp=ddp,
+        ddp_rank=ddp_rank,
+        ddp_world_size=ddp_world_size,
+        iterate_fn=lambda: iterate_examples("test"),
+        render_fn=_render_for_eval,
+        benchmark_name="MMLU",
+    )
+
+
+# Standalone CLI evaluation using a HuggingFace model
 if __name__ == "__main__":
     import argparse
+    from transformers import GPT2LMHeadModel
+    from evals import get_most_likely_row
 
     parser = argparse.ArgumentParser()
     parser.add_argument("-m", "--model_type", type=str, default="gpt2",
@@ -255,7 +238,6 @@ if __name__ == "__main__":
 
     subjects = None
     if args.subjects == "all":
-        # Discover all subjects from the test directory
         download()
         test_dir = os.path.join(DATA_CACHE_DIR, "test")
         subjects = sorted(
@@ -267,4 +249,26 @@ if __name__ == "__main__":
     elif args.subjects:
         subjects = [s.strip() for s in args.subjects.split(",")]
 
-    evaluate(args.model_type, args.device)
+    torch.set_float32_matmul_precision("high")
+    model = GPT2LMHeadModel.from_pretrained(args.model_type)
+    model.to(args.device)
+
+    num_correct = 0
+    num_total = 0
+    for subject, row in iterate_examples("test", subjects=subjects):
+        tokens, mask, label = render_example(subject, row)
+        tokens = tokens.to(args.device)
+        mask = mask.to(args.device)
+
+        with torch.no_grad():
+            logits = model(tokens).logits
+        pred_norm = get_most_likely_row(tokens, mask, logits)
+
+        num_total += 1
+        num_correct += int(pred_norm == label)
+
+        if num_total % 50 == 0:
+            print(f"MMLU {num_total} acc={num_correct / num_total:.4f}")
+
+    acc = num_correct / num_total
+    print(f"\nMMLU accuracy: {num_correct}/{num_total} = {acc:.4f}")
