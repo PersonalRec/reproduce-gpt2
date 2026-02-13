@@ -5,6 +5,7 @@ from torch.nn import functional as F
 import time
 import inspect
 import os
+import csv
 from hellaswag import render_example, iterate_examples
 import tiktoken
 import numpy as np
@@ -52,7 +53,7 @@ gpu_peak_flops = 209.5e12  # RTX 3090 bf16 tensor core TFLOPS
 
 # T4: 65 TFLOPS, No BF16 tensor support — use dtype=torch.float16 instead
 # RTX 3090 BF16:  142e12 (142 TFLOPS)
-# RTX 5090 BF16:  209.5e12 (142 TFLOPS)
+# RTX 5090 BF16:  209.5e12 (209.5 TFLOPS)
 
 # ================================================================================================================================
 
@@ -634,9 +635,12 @@ optimizer = raw_model.configure_optimizers(weight_decay=weight_decay, learning_r
 # create the log directory we will write checkpoints to and log to
 log_dir = "log"
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt") # record the losses
-with open(log_file, "w") as f: # open wor writing to clear the file
-    pass
+log_file = os.path.join(log_dir, "log.csv")
+# Write CSV header
+csv_columns = ["step", "train_loss", "val_loss", "hellaswag", "lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]
+with open(log_file, "w", newline="") as f:
+    writer = csv.writer(f)
+    writer.writerow(csv_columns)
 
 # TensorBoard writer (master process only)
 if master_process:
@@ -651,6 +655,10 @@ enc = tiktoken.get_encoding('gpt2') # iniatilize the encoder for token generatio
 for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
+
+    # Initialize per-step metrics (None = not computed this step)
+    step_val_loss = None
+    step_hellaswag = None
 
     # Once in a while evaluate our validation loss
     if step % eval_steps == 0 or last_step:
@@ -669,23 +677,28 @@ for step in range(max_steps):
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG) # average the accumulated gradients across all gpus
         
+        step_val_loss = val_loss_accum.item()
+
         # write logs and save model checkpoints
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
-            tb_writer.add_scalar("loss/val", val_loss_accum.item(), step)
+            print(f"validation loss: {step_val_loss:.4f}")
+            tb_writer.add_scalar("loss/val", step_val_loss, step)
             if step > 0 and (step % 5000 == 0 or last_step):
-                # optionally write model checkpoints
+                # write model checkpoints (includes optimizer state for resuming pre-training)
                 checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
                 checkpoint = {
                     'model': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
                     'config': raw_model.config,
                     'step': step,
-                    'val_loss': val_loss_accum.item()
+                    'val_loss': step_val_loss,
+                    'rng_state': {
+                        'python': torch.random.get_rng_state(),
+                        'numpy': np.random.get_state(),
+                    },
                 }
-                # you might also want to add optimizer.state_dict() and
-                # rng seeds etc., if you wanted to more exactly resume training
+                if device_type == "cuda":
+                    checkpoint['rng_state']['cuda'] = torch.cuda.get_rng_state(device)
                 torch.save(checkpoint, checkpoint_path)
     
     # Once in a while evaluate HellaSwag
@@ -717,10 +730,9 @@ for step in range(max_steps):
             num_total = num_total.item()
             num_correct_norm = num_correct_norm.item()
         acc_norm = num_correct_norm / num_total
+        step_hellaswag = acc_norm
         if master_process:
             print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
-            with open(log_file, "a") as f:
-                f.write(f"{step} hella {acc_norm:.4f}\n")
             tb_writer.add_scalar("eval/hellaswag", acc_norm, step)
                 
     
@@ -756,8 +768,20 @@ for step in range(max_steps):
     mfu = (flops_per_seq_fwd * B * grad_accum_steps * 3) / (dt * gpu_peak_flops)
     if master_process:
         print(f"step {step:5d} | loss: {loss_accum.item():.6f} | lr {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f} | mfu: {mfu:.2%}")
-        with open(log_file, "a") as f:
-            f.write(f"{step} train {loss_accum.item():.6f}\n")
+        # Write a single CSV row with all metrics for this step
+        with open(log_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                step,
+                f"{loss_accum.item():.6f}",
+                f"{step_val_loss:.4f}" if step_val_loss is not None else "",
+                f"{step_hellaswag:.4f}" if step_hellaswag is not None else "",
+                f"{lr:.6e}",
+                f"{norm:.4f}",
+                f"{tokens_per_sec:.2f}",
+                f"{mfu:.6f}",
+                f"{dt*1000:.2f}",
+            ])
         tb_writer.add_scalar("loss/train", loss_accum.item(), step)
         tb_writer.add_scalar("training/lr", lr, step)
         tb_writer.add_scalar("training/grad_norm", norm, step)

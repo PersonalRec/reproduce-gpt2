@@ -6,9 +6,13 @@ Compares the two training runs:
 - 050226: Improved version with RoPE, SwiGLU, and RMSNorm
 
 Saves the resulting plot to results/combined_comparison.png
+
+Supports both legacy .txt log format and the newer .csv log format.
 """
 import os
+import csv
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 
 sz = "124M"
@@ -37,6 +41,69 @@ hella3_baseline = {
     "1558M": 0.598,
 }[sz]
 
+
+def load_log_txt(log_path):
+    """Load legacy .txt log format: '{step} {stream} {value}' per line.
+    Returns a dict of streams: {'train': {step: val}, 'val': {...}, 'hella': {...}}
+    """
+    with open(log_path, "r") as f:
+        lines = f.readlines()
+
+    streams = {}
+    for line in lines:
+        parts = line.strip().split(" ")
+        if len(parts) >= 3:
+            k, stream, v = parts[0], parts[1], parts[2]
+            if stream not in streams:
+                streams[stream] = {}
+            streams[stream][int(k)] = float(v)
+    return streams
+
+
+def load_log_csv(log_path):
+    """Load new CSV log format with columns:
+    step, train_loss, val_loss, hellaswag, lr, grad_norm, tokens_per_sec, mfu, dt_ms
+    Returns a dict of streams matching the legacy format for compatibility.
+    """
+    df = pd.read_csv(log_path)
+
+    streams = {}
+
+    # Train loss (present on every row)
+    if "train_loss" in df.columns:
+        train_data = df[["step", "train_loss"]].dropna(subset=["train_loss"])
+        streams["train"] = dict(zip(train_data["step"].astype(int), train_data["train_loss"].astype(float)))
+
+    # Validation loss (only on eval steps)
+    if "val_loss" in df.columns:
+        val_data = df[["step", "val_loss"]].dropna(subset=["val_loss"])
+        if not val_data.empty:
+            streams["val"] = dict(zip(val_data["step"].astype(int), val_data["val_loss"].astype(float)))
+
+    # HellaSwag accuracy (only on eval steps)
+    if "hellaswag" in df.columns:
+        hella_data = df[["step", "hellaswag"]].dropna(subset=["hellaswag"])
+        if not hella_data.empty:
+            streams["hella"] = dict(zip(hella_data["step"].astype(int), hella_data["hellaswag"].astype(float)))
+
+    # Additional metrics (unique to CSV format)
+    for col in ["lr", "grad_norm", "tokens_per_sec", "mfu", "dt_ms"]:
+        if col in df.columns:
+            col_data = df[["step", col]].dropna(subset=[col])
+            if not col_data.empty:
+                streams[col] = dict(zip(col_data["step"].astype(int), col_data[col].astype(float)))
+
+    return streams
+
+
+def load_log(log_path):
+    """Auto-detect log format by file extension and load accordingly."""
+    if log_path.endswith(".csv"):
+        return load_log_csv(log_path)
+    else:
+        return load_log_txt(log_path)
+
+
 # Define log files to load
 log_files = {
     "gpt-2 (baseline)": "logs/log124M_40B_230126/01/26/log.txt",
@@ -47,19 +114,7 @@ log_files = {
 all_runs = {}
 for run_name, log_path in log_files.items():
     print(f"Loading {log_path}...")
-    with open(log_path, "r") as f:
-        lines = f.readlines()
-
-    # parse the individual lines, group by stream (train,val,hella)
-    streams = {}
-    for line in lines:
-        parts = line.strip().split(" ")
-        if len(parts) >= 3:
-            k, stream, v = parts[0], parts[1], parts[2]
-            if stream not in streams:
-                streams[stream] = {}
-            streams[stream][int(k)] = float(v)
-
+    streams = load_log(log_path)
     all_runs[run_name] = streams
 
     # print the streams
