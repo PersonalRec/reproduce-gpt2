@@ -50,9 +50,13 @@ More training steps = more exposure to data = better learning. The model hasn't 
 If we do several epochs instead of 1, the data comes in the exactly same order. It would be nice to shuffle/permutate data randomly, permute the documents around in every single shard in every single epoch for several epochs training. Potentially even permute the shards.
 
 
-### Larger Dataset
+### Larger/better Dataset
 
-Take bigger FineWeb-edu chunk instead of 10 billion tokens. Maybe add multi-language datasets, wikipedia, books, etc.
+Maybe try DCLM-baseline: https://huggingface.co/datasets/mlfoundations/dclm-baseline-1.0 
+
+Read the results and discussion: https://github.com/karpathy/llm.c/discussions/664 
+
+Take bigger FineWeb-edu chunk instead of 10 billion tokens. Or find a better dataset that outperforms Fineweb-edu in quality.
 
 
 ### Modern Tokenizer
@@ -100,7 +104,7 @@ Helps track the model's training progress in real time with nice visualization
 Measure MFU during training to find out how well my setup performs.
 
 
-### Implement model post-training on the custom dataset
+### Implement model post-training on the custom dataset (done)
 
 Take completely new dataset and post-train the pre-trained model on it.
 
